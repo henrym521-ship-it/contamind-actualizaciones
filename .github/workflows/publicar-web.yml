@@ -1,0 +1,115 @@
+# =========================================
+# PUBLICAR EL INSTALADOR DE CONTAMIND PARA LA PÁGINA WEB (hcsolucionesrd.com)
+# =========================================
+# Arma el instalador desde los pedazos públicos de Supabase (los mismos que usan las
+# actualizaciones), comprueba la huella SHA-256 y lo publica en «Releases» de ESTE
+# repositorio público. La página enlaza:
+#   https://github.com/henrym521-ship-it/contamind-actualizaciones/releases/latest/download/ContaMind-Setup.exe
+#
+# Cuándo corre:
+#   - Al publicar una versión nueva desde el Panel del Vendedor (cambia contamind_config.txt).
+#   - Al cambiar version_web.txt (para publicar en la web una versión que todavía no se avisó).
+#   - A mano: Actions → «Publicar instalador en la web» → Run workflow.
+# Se publica la versión MÁS ALTA entre las dos. Deja solo la última en Releases.
+# No usa claves: solo el permiso propio de este repositorio.
+# =========================================
+name: Publicar instalador en la web
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión a publicar (vacío = la más reciente conocida)"
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - contamind_config.txt
+      - version_web.txt
+      - .github/workflows/publicar-web.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar-web
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE: https://qmxtxzihtyrqrhoxpmqk.supabase.co/storage/v1/object/public/instaladores
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Elegir la versión
+        id: v
+        run: |
+          set -euo pipefail
+          desde_config=$(python3 - <<'PY'
+          import base64, json
+          try:
+              t = open("contamind_config.txt").read().strip().split(".")[1]
+              t += "=" * (-len(t) % 4)
+              print(json.loads(base64.urlsafe_b64decode(t))["version"]["numero"])
+          except Exception:
+              print("")
+          PY
+          )
+          desde_archivo=$(tr -d ' \r\n' < version_web.txt 2>/dev/null || true)
+          pedida="${{ github.event.inputs.version }}"
+          if [ -n "$pedida" ]; then v="$pedida"; else
+            v=$(printf "%s\n%s\n" "$desde_config" "$desde_archivo" | grep -E '^[0-9]+(\.[0-9]+)+$' | sort -V | tail -1)
+          fi
+          [ -n "$v" ] || { echo "::error::No se encontró ninguna versión"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Versión elegida: $v (config: ${desde_config:-—}, version_web.txt: ${desde_archivo:-—})"
+
+      - name: ¿Ya está publicada?
+        id: ya
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "si=1" >> "$GITHUB_OUTPUT"; echo "La v${{ steps.v.outputs.version }} ya está publicada."
+          else echo "si=0" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Armar el instalador desde Supabase y comprobar la huella
+        if: steps.ya.outputs.si == '0'
+        run: |
+          set -euo pipefail
+          v="${{ steps.v.outputs.version }}"
+          curl -fsSL "$BASE/$v/manifiesto.json" -o manifiesto.json
+          nombre=$(jq -r .nombre manifiesto.json)
+          sha=$(jq -r .sha256 manifiesto.json)
+          : > "$nombre"
+          for p in $(jq -r '.partes[]' manifiesto.json); do
+            case "$p" in */*|..*) echo "::error::Pedazo con nombre raro: $p"; exit 1;; esac
+            curl -fsSL "$BASE/$v/$p" >> "$nombre"
+          done
+          real=$(sha256sum "$nombre" | cut -d' ' -f1)
+          [ "$real" = "$sha" ] || { echo "::error::La huella no coincide ($real ≠ $sha)"; exit 1; }
+          cp "$nombre" ContaMind-Setup.exe
+          echo "$sha  $nombre" > SHA256.txt
+          echo "NOMBRE=$nombre" >> "$GITHUB_ENV"
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+          echo "Comprobado: $nombre ($(du -h "$nombre" | cut -f1)) — $sha"
+
+      - name: Publicar en Releases
+        if: steps.ya.outputs.si == '0'
+        run: |
+          set -euo pipefail
+          v="${{ steps.v.outputs.version }}"
+          printf 'ContaMind PRO %s para Windows 10 y 11 (64 bits).\n\n- `%s`: instalador de esta versión.\n- `ContaMind-Setup.exe`: el mismo archivo con nombre fijo, para el botón de descarga de hcsolucionesrd.com.\n\nHuella SHA-256: `%s`\n' "$v" "$NOMBRE" "$SHA" > notas.md
+          gh release create "v$v" "$NOMBRE" ContaMind-Setup.exe SHA256.txt -R "$GITHUB_REPOSITORY" \
+            --title "ContaMind PRO $v" --notes-file notas.md --latest
+          echo "### Publicado ContaMind PRO $v" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dejar solo la versión más reciente
+        run: |
+          v="${{ steps.v.outputs.version }}"
+          gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' |
+            grep -vx "v$v" | while read -r t; do
+              echo "Borrando $t"; gh release delete "$t" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            done
